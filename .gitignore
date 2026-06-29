@@ -1,0 +1,27 @@
+# Secrets / local config
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+.claude/
+
+# Logs
+*.log
+
+# IDE / editor
+.idea/
+*.iml
+
+# Stray local scaffolding (not part of the app)
+/untitled/
+/db:

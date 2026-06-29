@@ -1,0 +1,15 @@
+# Keep build context small — don't ship local venv, git, caches into images.
+.venv/
+venv/
+env/
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+.DS_Store
+*.log
+benchmarks/
+README.md

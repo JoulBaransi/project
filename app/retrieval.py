@@ -23,40 +23,27 @@ Why this order: keyword search is fast and precise when the question shares
 words with the docs (which the benchmark showed is common here). Vector search
 is the safety net for questions worded differently from the docs.
 
-Env vars (with defaults):
-    DB_HOST=localhost  DB_USER=root  DB_PASSWORD=  DB_NAME=shop
-    OLLAMA_HOST=http://localhost:11434
-    EMBED_MODEL=nomic-embed-text   CHAT_MODEL=llama3.5
+Refactored for the app: configuration comes from app.config, connections from
+app.db, the embedder is reused from app.ingest, and the grounded prompt comes
+from app.prompt_template — so there is ONE config/connection/prompt system.
 
-Deps:
-    pip install mysql-connector-python requests
+Run as a CLI (after ingesting):
+    python -m app.retrieval "How do I refund a payment?"
 """
 
-import os
-import sys
 import math
+import sys
 
 import requests
-import mysql.connector
 
+from app import config, db
+from app.ingest import embed          # reuse the validated Ollama embedder (768-dim)
+from app.prompt_template import build_prompt
 
-# ---------------------------------------------------------------- config -----
-DB = dict(
-    host=os.getenv("DB_HOST", "localhost"),
-    user=os.getenv("DB_USER", "root"),
-    password=os.getenv("DB_PASSWORD", ""),
-    database=os.getenv("DB_NAME", "shop"),
-)
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "llama3.2")
-
-TOP_K = 2                 # chunks to send to the model (benchmark: recall hits 100% at K=2)
-MIN_COSINE = 0.34         # vector-search relevance floor (from your benchmark)
-
-
-def get_db():
-    return mysql.connector.connect(**DB)
+# Tuned on the link-retrieval benchmark (re-measure with real embeddings before
+# locking — see CLAUDE.md / benchmarks/link_retrieval_benchmark.py).
+TOP_K = 2                 # chunks to send to the model (recall hit 100% at K=2)
+MIN_COSINE = 0.34         # vector-search relevance floor
 
 
 # ------------------------------------------------------------- step 1: kw -----
@@ -70,7 +57,7 @@ def keyword_search(question, top_k=TOP_K):
         ORDER BY score DESC
         LIMIT %s
     """
-    conn = get_db()
+    conn = db.get_connection()
     try:
         cur = conn.cursor(dictionary=True)
         cur.execute(sql, (question, question, top_k))
@@ -80,17 +67,6 @@ def keyword_search(question, top_k=TOP_K):
 
 
 # --------------------------------------------------------- step 2: vector -----
-def embed(text):
-    """Get an embedding vector for `text` from Ollama."""
-    r = requests.post(
-        f"{OLLAMA_HOST}/api/embeddings",
-        json={"model": EMBED_MODEL, "prompt": text},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["embedding"]
-
-
 def cosine(a, b):
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
@@ -106,7 +82,7 @@ def _parse_vector(s):
 def vector_search(question, top_k=TOP_K, min_sim=MIN_COSINE):
     """Semantic fallback: cosine similarity over stored embeddings, in Python."""
     qvec = embed(question)
-    conn = get_db()
+    conn = db.get_connection()
     try:
         cur = conn.cursor(dictionary=True)
         cur.execute("""
@@ -130,36 +106,52 @@ def vector_search(question, top_k=TOP_K, min_sim=MIN_COSINE):
 
 # ----------------------------------------------------------- orchestrate -----
 def retrieve(question, top_k=TOP_K):
-    """Keyword first; fall back to vector search if keyword finds nothing."""
+    """Keyword first; fall back to vector search if keyword finds nothing.
+
+    Returns (chunks, how) where how is 'keyword', 'vector', or 'none'.
+    """
     hits = keyword_search(question, top_k)
     if hits:
         return hits, "keyword"
-    return vector_search(question, top_k), "vector"
+    hits = vector_search(question, top_k)
+    return (hits, "vector") if hits else ([], "none")
 
 
 # ----------------------------------------------------------- step 3: LLM -----
+def generate(prompt):
+    """Call the Ollama chat model. Clear errors if Ollama/model is unavailable."""
+    try:
+        r = requests.post(
+            f"{config.OLLAMA_HOST}/api/generate",
+            json={"model": config.CHAT_MODEL, "prompt": prompt, "stream": False},
+            timeout=120,
+        )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(
+            f"Could not reach Ollama at {config.OLLAMA_HOST}. Is it running? ({e})"
+        ) from e
+    if r.status_code == 404:
+        raise RuntimeError(
+            f"Ollama has no model '{config.CHAT_MODEL}'. "
+            f"Run: ollama pull {config.CHAT_MODEL}"
+        )
+    r.raise_for_status()
+    return r.json()["response"].strip()
+
+
 def answer(question, top_k=TOP_K):
+    """Full RAG: retrieve grounding chunks, then generate a grounded answer.
+
+    Returns (answer_text, chunks, how). If nothing relevant is retrieved, returns
+    a clear "couldn't find it" message and does NOT call the model (no hallucination).
+    """
     chunks, how = retrieve(question, top_k)
     if not chunks:
-        return ("I couldn't find anything relevant in the Stripe docs for that.",
+        return ("I couldn't find anything relevant in the Stripe docs for that. "
+                "Try rephrasing, or make sure the corpus has been loaded.",
                 [], how)
-
-    context = "\n".join(f"- {c['content']} (LINK: {c['url']})" for c in chunks)
-    prompt = (
-        "You are a Stripe documentation assistant. Answer the user's question "
-        "USING ONLY the context lines below. Point them to the single most "
-        "relevant LINK. If the context doesn't contain the answer, say you don't "
-        "know.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n\nAnswer:"
-    )
-    r = requests.post(
-        f"{OLLAMA_HOST}/api/generate",
-        json={"model": CHAT_MODEL, "prompt": prompt, "stream": False},
-        timeout=120,
-    )
-    r.raise_for_status()
-    return r.json()["response"].strip(), chunks, how
+    text = generate(build_prompt(question, chunks))
+    return text, chunks, how
 
 
 # ------------------------------------------------------------------ cli -------

@@ -1,0 +1,12 @@
+# Stripe Docs RAG Assistant — Python 3.12
+# Pinned for reproducibility.
+
+# --- Backend (Flask API: app/) ---
+Flask==3.0.3
+mysql-connector-python==9.1.0   # 9.x speaks the MySQL 9 protocol incl. VECTOR type
+requests==2.32.3
+python-dotenv==1.0.1
+gunicorn==23.0.0                # WSGI server used to run the API in Docker
+
+# The web UI is a static frontend (frontend/index.html + app.js) served by
+# Flask — no frontend Python dependency.

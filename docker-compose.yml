@@ -1,0 +1,98 @@
+# Stripe Docs RAG Assistant — full local stack.
+#
+#   docker compose up --build
+#
+# Brings up MySQL 9 + Ollama (official images) and the Flask API (built here).
+# The API also serves the custom web UI (frontend/), so there is no separate UI
+# service. On first boot the `ollama-init` one-shot pulls the two models (~2GB) —
+# that takes a few minutes; until it finishes, /ask and /load return a clear
+# "model not ready" error.
+#
+# Everything is wired over the internal `ragnet` network. Host port mappings use
+# non-default numbers (5055/3307/11435) so they don't collide with anything you
+# already run locally (AirPlay on 5000, a local MySQL on 3306, a local Ollama on
+# 11434). Open the app at http://localhost:5055/.
+
+services:
+  mysql:
+    image: mysql:9.1
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: stripe_rag_pw   # MUST match the API's DB_PASSWORD below
+      MYSQL_DATABASE: stripe_rag
+    ports:
+      - "3307:3306"                        # host 3307 -> container 3306
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # Auto-apply schema on first boot (empty data dir only). Order matters:
+      #   01 creates the DB + files/qa_log, 02 adds the canonical docs_lines.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/docs_lines.sql:/docker-entrypoint-initdb.d/02_docs_lines.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pstripe_rag_pw"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [ragnet]
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0          # bind all interfaces so other containers reach it
+    ports:
+      - "11435:11434"               # host 11435 -> container 11434
+    volumes:
+      - ollama_models:/root/.ollama
+    networks: [ragnet]
+
+  # One-shot: waits for the Ollama server, then pulls the required models into
+  # the shared ollama_models volume. Exits 0 when done.
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434   # target the server container
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        until ollama list >/dev/null 2>&1; do
+          echo 'waiting for ollama server...'; sleep 2;
+        done;
+        echo 'pulling models...';
+        ollama pull llama3.2:3b &&
+        ollama pull nomic-embed-text &&
+        echo 'models ready.'
+    restart: "no"
+    networks: [ragnet]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: stripe_rag_pw     # MUST match MYSQL_ROOT_PASSWORD above
+      DB_NAME: stripe_rag
+      OLLAMA_HOST: http://ollama:11434
+      EMBED_MODEL: nomic-embed-text
+      CHAT_MODEL: llama3.2:3b
+    ports:
+      - "5055:5000"                  # host 5055 -> container 5000 (UI + API both here)
+    networks: [ragnet]
+
+volumes:
+  mysql_data:
+  ollama_models:
+
+networks:
+  ragnet:
